@@ -1,0 +1,315 @@
+"""The deterministic DHS layer applied after the visual engine returns."""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from worker import finish, verify
+
+
+def _spec(
+    *, words: int = 60, scenes: int = 8, calculated: bool = False,
+    series: str = "conversion",
+) -> dict:
+    prompts = [
+        {
+            "visual_prompt": f"Denver home exterior angle {i} with no readable text",
+            "on_screen_text": f"Denver step {i}",
+        }
+        for i in range(scenes)
+    ]
+    return {
+        "script": " ".join(["Denver"] * words),
+        "brokerage_line": "Engel & Völkers Aspen",
+        "scenes": {"narration": " ".join(["Denver"] * words), "scenes": prompts},
+        "finish": {
+            "opening_text": "Run the Denver numbers",
+            "cta_label": "RUN YOUR NUMBERS" if calculated else "EXPLORE DENVER HOME STORY",
+            "cta_display": (
+                "denverhomestory.com/calculator"
+                if calculated
+                else "denverhomestory.com"
+            ),
+            "calculator_url": (
+                "https://www.denverhomestory.com/calculator?rent=3500&savings=60000"
+                if calculated
+                else None
+            ),
+            "contract": {
+                "series": series,
+                "duration_min": 20 if series == "conversion" else 12,
+                "duration_max": 35 if series == "conversion" else 18,
+                "word_max": 75 if series == "conversion" else 42,
+                "scene_min": 7 if series == "conversion" else 5,
+                "scene_max": 9 if series == "conversion" else 6,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("spec", "reason"),
+    [
+        (_spec(words=76), "75 words"),
+        (_spec(scenes=6), "7 to 9"),
+        (_spec(scenes=10), "7 to 9"),
+        (_spec(calculated=True), "placeholder"),
+    ],
+)
+def test_preflight_refuses_an_output_that_cannot_meet_the_contract(
+    spec: dict, reason: str,
+) -> None:
+    if reason == "placeholder":
+        spec["finish"]["calculator_url"] = None
+        reason = "seeded calculator"
+    with pytest.raises(verify.Rejected, match=reason):
+        finish.validate(spec)
+
+
+def test_preflight_refuses_repeated_visual_prompts() -> None:
+    spec = _spec()
+    spec["scenes"]["scenes"][3]["visual_prompt"] = spec["scenes"]["scenes"][0][
+        "visual_prompt"
+    ].upper()
+    with pytest.raises(verify.Rejected, match="repeat"):
+        finish.validate(spec)
+
+
+def test_growth_preflight_accepts_its_short_contract_and_rejects_conversion_length() -> None:
+    finish.validate(_spec(words=30, scenes=5, series="denver_decoded"))
+    with pytest.raises(verify.Rejected, match="5 to 6"):
+        finish.validate(_spec(words=30, scenes=7, series="denver_decoded"))
+
+
+def test_duration_bounds_come_from_the_trusted_series_contract() -> None:
+    assert finish.duration_bounds(_spec(series="conversion")) == (20, 35)
+    assert finish.duration_bounds(_spec(series="denver_decoded")) == (12, 18)
+
+
+def test_ffmpeg_reads_every_piece_of_copy_from_a_file(tmp_path: Path) -> None:
+    files = {}
+    for name in (
+        "opening-0", "opening-1", "label", "display-0", "display-1",
+        "brokerage-0", "brokerage-1",
+    ):
+        path = tmp_path / f"{name}.txt"
+        path.write_text("danger: text='must never enter the filter'", encoding="utf-8")
+        files[name] = path
+    cmd = finish.build_command(
+        tmp_path / "source.mp4",
+        tmp_path / "out.mp4",
+        duration=24.0,
+        background=tmp_path / "card.png",
+        opening_files=[files["opening-0"], files["opening-1"]],
+        cta_label_file=files["label"],
+        cta_display_files=[files["display-0"], files["display-1"]],
+        brokerage_files=[files["brokerage-0"], files["brokerage-1"]],
+        font=None,
+        mark=None,
+    )
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "danger:" not in graph
+    assert "must never" not in graph
+    assert graph.count("textfile=") == 7
+
+
+def test_calculator_capture_timeout_uses_the_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "calculator.png"
+    destination.write_bytes(b"partial chromium output")
+    monkeypatch.setattr(
+        finish,
+        "_CHROMIUM_CANDIDATES",
+        (str(tmp_path / "chromium"),),
+    )
+    (tmp_path / "chromium").touch()
+
+    def times_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout", 45))
+
+    monkeypatch.setattr(subprocess, "run", times_out)
+
+    assert finish.capture_calculator(
+        "https://www.denverhomestory.com/calculator?rent=3500&savings=60000",
+        destination,
+    ) is False
+    assert not destination.exists()
+
+
+def test_finish_copy_wraps_inside_the_vertical_safe_area() -> None:
+    from PIL import ImageFont
+
+    font_path = finish.default_font()
+    if font_path is None:
+        pytest.skip("no production font available")
+
+    samples = (
+        (finish.opening_copy("Renting at $3,500? Compare five years."), 56, 840),
+        (
+            finish.display_copy("denverhomestory.com/calculator"),
+            52,
+            840,
+        ),
+        (
+            finish.brokerage_copy(
+                "Engel & Voelkers · Each office independently owned and operated"
+            ),
+            27,
+            840,
+        ),
+    )
+    for rendered, size, safe_width in samples:
+        measured = ImageFont.truetype(font_path, size)
+        assert all(
+            measured.getbbox(line)[2] - measured.getbbox(line)[0] <= safe_width
+            for line in rendered.splitlines()
+        ), rendered
+
+    assert finish.display_copy("denverhomestory.com/calculator") == (
+        "www.denverhomestory.com\n/calculator"
+    )
+
+
+def test_each_visual_line_gets_its_own_text_file(tmp_path: Path) -> None:
+    files = finish.line_files(
+        tmp_path,
+        "display",
+        finish.display_copy("denverhomestory.com/calculator"),
+    )
+    assert [path.read_text(encoding="utf-8") for path in files] == [
+        "www.denverhomestory.com",
+        "/calculator",
+    ]
+    assert all("\n" not in path.read_text(encoding="utf-8") for path in files)
+
+
+HAS_MEDIA_TOOLS = all(shutil.which(tool) for tool in ("ffmpeg", "ffprobe"))
+
+
+def _source(path: Path, seconds: int = 22) -> None:
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"color=c=0x78909c:s=1080x1920:r=8:d={seconds}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.mark.skipif(not HAS_MEDIA_TOOLS, reason="ffmpeg/ffprobe not on PATH")
+def test_real_finish_builds_a_vertical_branded_fallback_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    _source(source)
+    monkeypatch.setattr(verify, "reject_readable_digits", lambda *a, **k: [])
+    destination = tmp_path / "finished.mp4"
+
+    report = finish.apply(
+        source,
+        destination,
+        spec=_spec(),
+        mark=Path(__file__).parents[1] / "assets" / "dhs-mark.png",
+        font=None,
+    )
+
+    probe = verify.check(
+        destination, expect_audio=True, min_seconds=20, max_seconds=35
+    )
+    assert (probe.width, probe.height) == (1080, 1920)
+    assert report.used_calculator is False
+    assert report.duration == pytest.approx(probe.duration, abs=0.1)
+
+
+@pytest.mark.skipif(not HAS_MEDIA_TOOLS, reason="ffmpeg/ffprobe not on PATH")
+def test_real_finish_uses_an_authorized_calculator_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.mp4"
+    _source(source)
+    monkeypatch.setattr(verify, "reject_readable_digits", lambda *a, **k: [])
+
+    def fake_capture(url: str, destination: Path) -> bool:
+        assert finish.authorized_calculator_url(url)
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                "color=c=0xd4a953:s=1080x1920", "-frames:v", "1", str(destination),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return True
+
+    monkeypatch.setattr(finish, "capture_calculator", fake_capture)
+    report = finish.apply(
+        source,
+        tmp_path / "finished.mp4",
+        spec=_spec(calculated=True),
+        mark=Path(__file__).parents[1] / "assets" / "dhs-mark.png",
+        font=None,
+    )
+    assert report.used_calculator is True
+
+
+HAS_OCR = HAS_MEDIA_TOOLS and shutil.which("tesseract") is not None
+
+
+@pytest.mark.skipif(not HAS_OCR, reason="tesseract not on PATH")
+def test_ocr_refuses_a_central_address_number(tmp_path: Path) -> None:
+    video = tmp_path / "number.mp4"
+    font = finish.default_font()
+    if font is None:
+        pytest.skip("no font available for the OCR fixture")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+            "color=c=white:s=1080x1920:r=4:d=7", "-f", "lavfi", "-i",
+            "sine=frequency=440:duration=7", "-vf",
+            (
+                f"drawtext=fontfile='{font}':text='19239':fontcolor=black:"
+                "fontsize=180:x=(w-text_w)/2:y=650"
+            ),
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(video),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    with pytest.raises(verify.Rejected, match="19239"):
+        verify.reject_readable_digits(video, tmp_path / "ocr", before_seconds=4.0)
+
+
+@pytest.mark.skipif(not HAS_OCR, reason="tesseract not on PATH")
+def test_ocr_ignores_platform_caption_region(tmp_path: Path) -> None:
+    video = tmp_path / "caption-number.mp4"
+    font = finish.default_font()
+    if font is None:
+        pytest.skip("no font available for the OCR fixture")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+            "color=c=white:s=1080x1920:r=4:d=7", "-f", "lavfi", "-i",
+            "sine=frequency=440:duration=7", "-vf",
+            (
+                f"drawtext=fontfile='{font}':text='71000':fontcolor=black:"
+                "fontsize=150:x=(w-text_w)/2:y=1600"
+            ),
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(video),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert verify.reject_readable_digits(
+        video, tmp_path / "ocr", before_seconds=4.0
+    ) == []
